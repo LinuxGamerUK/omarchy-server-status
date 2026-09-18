@@ -16,7 +16,7 @@ Panel {
   // Kept in step with manifest.json by a test, rather than read from disk at
   // runtime: the panel should not gain a file read and a failure mode just to
   // print its own version.
-  readonly property string pluginVersion: "0.9.1"
+  readonly property string pluginVersion: "0.10.0"
   readonly property string pluginName: "Tailscale Host Monitor"
   readonly property string repoUrl: "https://github.com/nixfred/omarchy-server-status"
   readonly property string authorUrl: "https://nixfred.com"
@@ -122,6 +122,12 @@ Panel {
   readonly property var snapshot: snapshotsByHost[activeHost] || ({ host: null, containers: [], error: "" })
   readonly property var hostInfo: snapshot.host || null
   readonly property var containers: snapshot.containers instanceof Array ? snapshot.containers : []
+  readonly property var appContainers: containers.filter(function(item) {
+    return String(item && item.runtime || "") !== "kvm"
+  })
+  readonly property var virtualMachines: containers.filter(function(item) {
+    return String(item && item.runtime || "") === "kvm"
+  })
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -404,7 +410,24 @@ Panel {
   }
 
   function isWarningMuted(hostAlias, warningId) {
-    return warningIds(hostAlias).indexOf(String(warningId || "")) >= 0
+    var ids = warningIds(hostAlias)
+    var id = String(warningId || "")
+    if (ids.indexOf(id) >= 0) return true
+    // Container warning ids gained a runtime segment when Docker and Podman
+    // became collectable together ("container-docker-web-1" rather than
+    // "container-web-1"). Mutes recorded before that still name the old id, and
+    // a mute silently reverting is worse than a stale entry: someone muted that
+    // card on purpose. Accept the legacy form for docker, which is what every
+    // pre-existing mute was.
+    var legacy = legacyWarningId(id)
+    return legacy !== "" && ids.indexOf(legacy) >= 0
+  }
+
+  function legacyWarningId(warningId) {
+    var id = String(warningId || "")
+    return id.indexOf("container-docker-") === 0
+      ? "container-" + id.slice("container-docker-".length)
+      : ""
   }
 
   function isHostMuted(hostAlias) {
@@ -439,8 +462,15 @@ Panel {
     var nextMap = Object.assign({}, mutedWarningsByHost)
     var nextIds = warningIds(host).slice()
     var index = nextIds.indexOf(id)
-    if (index >= 0) nextIds.splice(index, 1)
-    else nextIds.push(id)
+    // Unmuting must also clear a legacy entry, or the card would re-mute itself
+    // on the next read through the compatibility path above.
+    var legacy = legacyWarningId(id)
+    var legacyIndex = legacy !== "" ? nextIds.indexOf(legacy) : -1
+    if (index >= 0 || legacyIndex >= 0) {
+      if (index >= 0) nextIds.splice(index, 1)
+      legacyIndex = legacy !== "" ? nextIds.indexOf(legacy) : -1
+      if (legacyIndex >= 0) nextIds.splice(legacyIndex, 1)
+    } else nextIds.push(id)
     if (nextIds.length > 0) nextMap[host] = nextIds
     else delete nextMap[host]
     mutedWarningsByHost = nextMap
@@ -449,7 +479,8 @@ Panel {
   }
 
   function containerWarningId(container) {
-    return "container-" + String(container && container.name || "")
+    var runtime = String(container && container.runtime || "docker")
+    return "container-" + runtime + "-" + String(container && container.name || "")
   }
 
   function copyText(value) {
@@ -759,12 +790,14 @@ Panel {
       return "pass"
     }
     if (container.state === "restarting") return "fail"
+    if (container.state === "paused") return "warn"
     if (container.state === "exited" || container.state === "dead") return "warn"
     return "unknown"
   }
 
   function containerDetail(container) {
     var parts = []
+    if (container.runtime) parts.push(String(container.runtime))
     if (container.cpuPercent !== null) parts.push("cpu " + container.cpuPercent.toFixed(1) + "%")
     if (container.memPercent !== null)
       parts.push("mem " + formatBytes(container.memUsageBytes) + " (" + container.memPercent.toFixed(0) + "%)")
@@ -773,6 +806,21 @@ Panel {
     else parts.push(container.state)
     return parts.join(" · ")
   }
+
+  function vmDetail(vm) {
+    var parts = []
+    if (vm.memLimitBytes !== null && vm.memLimitBytes > 0) {
+      if (vm.state === "running" && vm.memUsageBytes !== null) {
+        parts.push("mem " + formatBytes(vm.memUsageBytes) + " (" + vm.memPercent.toFixed(0) + "%)")
+      } else {
+        parts.push("alloc " + formatBytes(vm.memLimitBytes))
+      }
+    }
+    if (vm.status) parts.push(String(vm.status))
+    else parts.push(String(vm.state))
+    return parts.join(" · ")
+  }
+
 
   function summaryFor(hostAlias) {
     if (isHostMuted(hostAlias)) return "pass"
@@ -1666,10 +1714,10 @@ Panel {
           Column {
             width: parent.width
             spacing: Style.space(8)
-            visible: !root.pickerOpen && root.activeDevice && root.containers.length > 0
+            visible: !root.pickerOpen && root.activeDevice && root.appContainers.length > 0
 
             PanelSectionHeader {
-              text: `CONTAINERS · ${root.containers.length}`
+              text: `CONTAINERS · ${root.appContainers.length}`
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -1678,15 +1726,44 @@ Panel {
               id: containerFlow
               width: parent.width
               spacing: Style.space(8)
-              readonly property int columns: root.containers.length > 20 ? 6 : (root.containers.length > 9 ? 4 : 3)
+              readonly property int columns: root.appContainers.length > 20 ? 6 : (root.appContainers.length > 9 ? 4 : 3)
 
               Repeater {
-                model: root.containers
+                model: root.appContainers
 
                 ContainerTile {
                   required property var modelData
                   width: (containerFlow.width - Style.space(8) * (containerFlow.columns - 1)) / containerFlow.columns
                   container: modelData
+                }
+              }
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: !root.pickerOpen && root.activeDevice && root.virtualMachines.length > 0
+
+            PanelSectionHeader {
+              text: `VIRTUAL MACHINES · ${root.virtualMachines.length}`
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Flow {
+              id: vmFlow
+              width: parent.width
+              spacing: Style.space(8)
+              readonly property int columns: root.virtualMachines.length > 20 ? 6 : (root.virtualMachines.length > 9 ? 4 : 3)
+
+              Repeater {
+                model: root.virtualMachines
+
+                VmTile {
+                  required property var modelData
+                  width: (vmFlow.width - Style.space(8) * (vmFlow.columns - 1)) / vmFlow.columns
+                  vm: modelData
                 }
               }
             }
@@ -2250,6 +2327,99 @@ Panel {
       enabled: containerTile.canToggleMute
       cursorShape: Qt.PointingHandCursor
       onClicked: root.toggleWarningMute(root.activeHost, containerTile.warningId)
+    }
+  }
+
+  component VmTile: Rectangle {
+    id: vmTile
+    required property var vm
+    readonly property string healthState: root.containerState(vm)
+    readonly property string warningId: root.containerWarningId(vm)
+    readonly property bool muted: root.isWarningMuted(root.activeHost, warningId)
+    readonly property bool canToggleMute: muted || healthState === "warn" || healthState === "fail"
+    readonly property string displayState: healthState
+    implicitHeight: Style.space(50)
+    radius: Style.cornerRadius
+    color: Util.alpha(root.foreground, 0.045)
+    border.width: canToggleMute ? 1 : 0
+    border.color: Util.alpha(root.stateColor(displayState), 0.55)
+
+    RowLayout {
+      anchors.fill: parent
+      anchors.margins: Style.space(8)
+      spacing: Style.space(7)
+
+      Rectangle {
+        Layout.preferredWidth: Style.space(10)
+        Layout.preferredHeight: Style.space(10)
+        radius: width / 2
+        color: root.stateColor(vmTile.displayState)
+      }
+
+      ColumnLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(3)
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: root.displayContainerName(vmTile.vm)
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            elide: Text.ElideRight
+          }
+
+          Rectangle {
+            Layout.preferredHeight: Style.space(15)
+            Layout.preferredWidth: Style.space(32)
+            radius: Style.space(3)
+            color: Util.alpha(root.foreground, 0.08)
+
+            Text {
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: "KVM"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          text: root.vmDetail(vmTile.vm)
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        visible: vmTile.canToggleMute || vmTile.vm.memPercent !== null
+        text: vmTile.muted ? "MUTED" : (vmTile.canToggleMute ? "MUTE" : Math.round(vmTile.vm.memPercent) + "%")
+        color: root.stateColor(vmTile.displayState)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+      }
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      enabled: vmTile.canToggleMute
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.toggleWarningMute(root.activeHost, vmTile.warningId)
     }
   }
 
