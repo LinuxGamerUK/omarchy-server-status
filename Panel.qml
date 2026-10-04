@@ -167,10 +167,10 @@ Panel {
     runtimeProbeOutput = ""
     runtimeProbe.command = ["timeout", "-k", "2", "1", "/bin/sh", "-c",
       "for candidate in bun \"$HOME/.bun/bin/bun\" /usr/bin/bun /usr/local/bin/bun; do" +
-      " if [ -x \"$candidate\" ]; then case \"$candidate\" in" +
-      " /*) printf '%s\\n' \"$candidate\"; exit 0;;" +
-      " *) p=$(command -v -- \"$candidate\") && [ -n \"$p\" ] && printf '%s\\n' \"$p\" && exit 0;;" +
-      " esac; fi; done; exit 1"]
+      " case \"$candidate\" in" +
+      " /*) if [ -x \"$candidate\" ]; then printf '%s\\n' \"$candidate\"; exit 0; fi;;" +
+      " *) p=$(command -v -- \"$candidate\") && case \"$p\" in /*) printf '%s\\n' \"$p\"; exit 0;; esac;;" +
+      " esac; done; exit 1"]
     runtimeProbe.running = true
     runtimeProbeKillTimer.start()
   }
@@ -188,9 +188,11 @@ Panel {
       tailnetRefreshing = false
       refreshing = false
       lastError = runtimeMissingError()
-      if (!tailnetInitialScanComplete) {
-        tailnetInitialScanComplete = true
-      }
+      // Nothing can be scanned without the runtime: close the startup
+      // bookkeeping so the header stops reading "Preparing startup scan".
+      tailnetInitialScanComplete = true
+      startupSweepStarted = true
+      startupSweepComplete = true
     }
   }
 
